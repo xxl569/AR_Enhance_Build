@@ -71,6 +71,7 @@ xcrun --sdk iphoneos clang++ \
   -e _NSExtensionMain \
   -I"$GEN_DIR" \
   -framework Foundation \
+  -framework CoreFoundation \
   -framework Intents \
   -lobjc \
   "$GEN_DIR/EnsureDaemonIntent.m" \

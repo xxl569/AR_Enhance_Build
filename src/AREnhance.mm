@@ -54,6 +54,8 @@ static NSString *const kARSuiteName            = @"net.limneos.audiorecorder";
 static NSString *const kARDefaultsTmpPath      = @"/tmp/.audioRecDefaults";
 static NSString *const kARBootAlivePath        = @"/tmp/.ar_enhance_boot_alive";
 static NSString *const kARDaemonPidPath        = @"/tmp/.ar_daemon_pid";
+static NSString *const kARDaemonPongPath       = @"/tmp/.ar_daemon_pong";
+static NSString *const kARWantBgRecoverPath    = @"/tmp/.ar_want_bg_recover";
 static NSString *const kARMainExecPath         = @"/tmp/.ar_main_exec_path";
 static NSString *const kARLogPath              = @"/tmp/ar_enhance.log";
 static NSString *const kARQQProbeLogPath       = @"/tmp/ar_qq_probe.log";
@@ -62,6 +64,7 @@ static NSString *const kQQDisplayName          = @"QQ";
 
 static const char *const kARNotifyStatus       = "net.limneos.audiorecorder.status";
 static const char *const kARNotifyPrefsInt     = "net.limneos.audiorecorder.prefsChangedInternal";
+static const char *const kARNotifyPing         = "net.limneos.audiorecorder.arenhance.ping";
 
 // AudioRecorder 6.0.3 (arm64 slice) 全局变量相对 0x100000000 静态地址偏移
 static const uintptr_t kARAddrCallStatusDict   = 0x100179618ULL;
@@ -1451,6 +1454,47 @@ static BOOL ARIsChildRecorderHelperProcess(void) {
     return NO;
 }
 
+static void ARWriteDaemonPong(void) {
+    @autoreleasepool {
+        NSString *pong = [NSString stringWithFormat:@"%d %lld %.3f\n",
+                          getpid(),
+                          ARGetSystemBootTimeSeconds(),
+                          [[NSDate date] timeIntervalSince1970]];
+        [pong writeToFile:kARDaemonPongPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        chmod(kARDaemonPongPath.UTF8String, 0666);
+    }
+}
+
+// 一次性清理旧版 v4 主 App 遗留的 SiriKit 捐赠缓存，避免快捷指令重复显示两条动作
+static void ARClearLegacyShortcutDonations(void) {
+    @autoreleasepool {
+        @try {
+            dlopen("/System/Library/Frameworks/Intents.framework/Intents", RTLD_LAZY);
+            Class interCls = NSClassFromString(@"INInteraction");
+            SEL delSel = NSSelectorFromString(@"deleteAllInteractionsWithCompletion:");
+            if (interCls && [interCls respondsToSelector:delSel]) {
+                void (^comp)(NSError *) = ^(NSError *error) {
+                    if (error) {
+                        ARLog(@"清理旧 INInteraction 失败：%@", error);
+                    }
+                };
+                ((void (*)(id, SEL, id))objc_msgSend)(interCls, delSel, comp);
+            }
+            Class centerCls = NSClassFromString(@"INVoiceShortcutCenter");
+            SEL sharedSel = NSSelectorFromString(@"sharedCenter");
+            SEL setSugSel = NSSelectorFromString(@"setShortcutSuggestions:");
+            if (centerCls && [centerCls respondsToSelector:sharedSel]) {
+                id center = ((id (*)(id, SEL))objc_msgSend)(centerCls, sharedSel);
+                if (center && [center respondsToSelector:setSugSel]) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(center, setSugSel, @[]);
+                }
+            }
+        } @catch (NSException *ex) {
+            ARLog(@"清理旧捐赠缓存异常：%@", ex);
+        }
+    }
+}
+
 __attribute__((constructor))
 static void AREnhanceInit(void) {
     @autoreleasepool {
@@ -1465,6 +1509,14 @@ static void AREnhanceInit(void) {
             NSString *pidInfo = [NSString stringWithFormat:@"%d %lld\n", getpid(), ARGetSystemBootTimeSeconds()];
             [pidInfo writeToFile:kARDaemonPidPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
             chmod(kARDaemonPidPath.UTF8String, 0666);
+
+            // 立即写出 Pong 并常驻监听 Ping 通知，穿透 .appex Seatbelt 沙盒完成存活应答
+            ARWriteDaemonPong();
+            static int sPingToken = 0;
+            notify_register_dispatch(kARNotifyPing, &sPingToken,
+                                     dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(int token) {
+                ARWriteDaemonPong();
+            });
 
             // 确保守护进程启动时 /tmp/.audioRecDefaults 含 QQ 默认设置
             if (![[NSFileManager defaultManager] fileExistsAtPath:kARDefaultsTmpPath]) {
@@ -1484,6 +1536,21 @@ static void AREnhanceInit(void) {
             chmod(kARMainExecPath.UTF8String, 0666);
         }
         ARLog(@"AREnhance.dylib 已加载至主 App 进程");
+
+        // 若是扩展通过 FrontBoard 挂起唤醒来触发后台恢复，在主 App constructor 内同步拉起守护进程
+        if ([[NSFileManager defaultManager] fileExistsAtPath:kARWantBgRecoverPath]) {
+            NSString *reqStr = [NSString stringWithContentsOfFile:kARWantBgRecoverPath
+                                                         encoding:NSUTF8StringEncoding
+                                                            error:nil];
+            unlink(kARWantBgRecoverPath.UTF8String);
+            int64_t reqBoot = [[reqStr stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] longLongValue];
+            int64_t curBoot = ARGetSystemBootTimeSeconds();
+            if (reqBoot == 0 || reqBoot == curBoot) {
+                NSString *recoverMsg = nil;
+                AREnsureDaemonRunning(&recoverMsg);
+                ARLog(@"响应扩展后台恢复请求完成：%@", recoverMsg);
+            }
+        }
 
         Class appCls = NSClassFromString(@"AudioRecorderApplication");
         if (appCls) {
@@ -1521,5 +1588,11 @@ static void AREnhanceInit(void) {
             ARSwizzleMethod(tableCls, NSSelectorFromString(@"generateAppIcons"),
                             (IMP)hook_table_generateAppIcons, (IMP *)&orig_table_generateAppIcons, "v@:");
         }
+
+        // 5. 延迟清理旧版 v4 残留的重复快捷指令捐赠缓存
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            ARClearLegacyShortcutDonations();
+        });
     }
 }
