@@ -18,7 +18,7 @@
 	<array>
 		<dict>
 			<key>INIntentCategory</key>
-			<string>run</string>
+			<string>do</string>
 			<key>INIntentClassPrefix</key>
 			<string>AR</string>
 			<key>INIntentConfigurable</key>
@@ -97,7 +97,7 @@
 			<key>INIntentUserConfirmationRequired</key>
 			<false/>
 			<key>INIntentVerb</key>
-			<string>Run</string>
+			<string>Do</string>
 		</dict>
 	</array>
 	<key>INTypes</key>

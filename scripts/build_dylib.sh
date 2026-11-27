@@ -25,11 +25,6 @@ if [ -n "$INTENT_BUILDER" ]; then
     -swiftVersion 5.0
 
   mkdir -p "$GEN_DIR/compiled"
-  "$INTENT_BUILDER" compile -help 2>&1 || true
-  "$INTENT_BUILDER" compile \
-    -input "$ROOT_DIR/src/ARAutoStart.intentdefinition" \
-    -output "$GEN_DIR/compiled" \
-    -outputFormat binary || \
   "$INTENT_BUILDER" compile \
     -input "$ROOT_DIR/src/ARAutoStart.intentdefinition" \
     -output "$GEN_DIR/compiled"
