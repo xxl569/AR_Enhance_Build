@@ -6,10 +6,14 @@
 
 #import <Foundation/Foundation.h>
 #import <Intents/Intents.h>
+#import <mach-o/dyld.h>
 #import <sys/sysctl.h>
 #import <sys/stat.h>
 #import <spawn.h>
 #import <unistd.h>
+#import <signal.h>
+#import <errno.h>
+#import <stdlib.h>
 #import <notify.h>
 #import <string.h>
 
@@ -37,6 +41,8 @@ extern "C" {
 static NSString *const kARExtSuiteName       = @"net.limneos.audiorecorder";
 static NSString *const kARExtDefaultsTmpPath = @"/tmp/.audioRecDefaults";
 static NSString *const kARExtBootAlivePath   = @"/tmp/.ar_enhance_boot_alive";
+static NSString *const kARExtDaemonPidPath   = @"/tmp/.ar_daemon_pid";
+static NSString *const kARExtMainExecPath    = @"/tmp/.ar_main_exec_path";
 static NSString *const kARExtLogPath         = @"/tmp/ar_enhance.log";
 static NSString *const kARExtQQBundleID      = @"com.tencent.mqq";
 static const char *const kARExtNotifyPrefs   = "net.limneos.audiorecorder.prefsChangedInternal";
@@ -112,7 +118,65 @@ static BOOL ARExtProcessHasDaemonArg(pid_t pid) {
     return found;
 }
 
-static pid_t ARExtFindRunningDaemonPID(void) {
+// 三级守护进程存活检测：绕开 uid=501 调用 KERN_PROCARGS2 查询 uid=0 进程被 EPERM 拒绝的问题
+static pid_t ARExtFindRunningDaemonPID(NSString *__autoreleasing *outSource) {
+    pid_t selfPid = getpid();
+    int64_t bootTime = ARExtGetSystemBootTimeSeconds();
+
+    // 一级：读取 /tmp/.ar_daemon_pid + kill(0) + KERN_PROC_PID 校验 p_comm
+    NSString *pidInfo = [NSString stringWithContentsOfFile:kARExtDaemonPidPath
+                                                  encoding:NSUTF8StringEncoding
+                                                     error:nil];
+    if (pidInfo.length > 0) {
+        NSArray<NSString *> *parts = [[pidInfo stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]
+                                      componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (parts.count >= 2) {
+            pid_t recPid = (pid_t)[parts[0] intValue];
+            int64_t recBoot = [parts[1] longLongValue];
+            if (recPid > 1 && recPid != selfPid && recBoot == bootTime) {
+                errno = 0;
+                if (kill(recPid, 0) == 0 || errno == EPERM) {
+                    struct kinfo_proc kp;
+                    memset(&kp, 0, sizeof(kp));
+                    size_t klen = sizeof(kp);
+                    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, recPid};
+                    if (sysctl(mib, 4, &kp, &klen, NULL, 0) == 0 && klen >= sizeof(kp)) {
+                        if (strncmp(kp.kp_proc.p_comm, "AudioRecorder", 13) == 0) {
+                            if (outSource) *outSource = @"pidfile";
+                            return recPid;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 二级：KERN_PROC_ALL 全局扫描 p_comm == "AudioRecorder" 且 e_ucred.cr_uid == 0
+    int mibAll[3] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL};
+    size_t ksize = 0;
+    if (sysctl(mibAll, 3, NULL, &ksize, NULL, 0) == 0 && ksize > 0) {
+        size_t allocSize = ksize + sizeof(struct kinfo_proc) * 16;
+        struct kinfo_proc *klist = (struct kinfo_proc *)malloc(allocSize);
+        if (klist) {
+            size_t actualSize = allocSize;
+            if (sysctl(mibAll, 3, klist, &actualSize, NULL, 0) == 0 && actualSize >= sizeof(struct kinfo_proc)) {
+                size_t n = actualSize / sizeof(struct kinfo_proc);
+                for (size_t i = 0; i < n; i++) {
+                    pid_t pid = klist[i].kp_proc.p_pid;
+                    if (pid <= 1 || pid == selfPid) continue;
+                    if (strncmp(klist[i].kp_proc.p_comm, "AudioRecorder", 13) == 0 &&
+                        klist[i].kp_eproc.e_ucred.cr_uid == 0) {
+                        free(klist);
+                        if (outSource) *outSource = @"kinfo_root";
+                        return pid;
+                    }
+                }
+            }
+            free(klist);
+        }
+    }
+
+    // 三级：原有 proc_listpids + proc_pidpath + KERN_PROCARGS2 兜底
     int byteCount = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
     if (byteCount <= 0) return -1;
     int cap = (byteCount / (int)sizeof(pid_t)) + 64;
@@ -121,7 +185,6 @@ static pid_t ARExtFindRunningDaemonPID(void) {
 
     int actualBytes = proc_listpids(PROC_ALL_PIDS, 0, pids, cap * (int)sizeof(pid_t));
     int count = actualBytes / (int)sizeof(pid_t);
-    pid_t selfPid = getpid();
     pid_t result = -1;
 
     char pathBuf[PROC_PIDPATHINFO_MAXSIZE];
@@ -133,6 +196,7 @@ static pid_t ARExtFindRunningDaemonPID(void) {
             if (strstr(pathBuf, "/AudioRecorder.app/AudioRecorder") != NULL) {
                 if (ARExtProcessHasDaemonArg(pid)) {
                     result = pid;
+                    if (outSource) *outSource = @"procargs";
                     break;
                 }
             }
@@ -188,54 +252,132 @@ static void ARExtSyncPreferencesToTmp(void) {
     }
 }
 
+@interface ARAutoStartIntentExtensionHandler : INExtension <EnsureDaemonIntentHandling>
+@end
+
 static NSString *ARExtMainExecutablePath(void) {
-    // 当前位于 AudioRecorder.app/PlugIns/ARAutoStartIntents.appex
-    NSString *extPath = [[NSBundle mainBundle] bundlePath];
-    NSString *appDir = [[extPath stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
-    NSString *execPath = [appDir stringByAppendingPathComponent:@"AudioRecorder"];
-    if (execPath.length > 0 && access(execPath.UTF8String, X_OK) == 0) {
-        return execPath;
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+
+    // 候选 1：_NSGetExecutablePath + realpath，往上 3 级得到 AudioRecorder.app/AudioRecorder
+    uint32_t bufSize = 4096;
+    char rawExec[4096];
+    memset(rawExec, 0, sizeof(rawExec));
+    if (_NSGetExecutablePath(rawExec, &bufSize) == 0) {
+        char resolvedExec[4096];
+        const char *usedPath = realpath(rawExec, resolvedExec) ? resolvedExec : rawExec;
+        NSString *nsExec = [NSString stringWithUTF8String:usedPath];
+        if (nsExec.length > 0) {
+            NSString *appDir = [[[nsExec stringByDeletingLastPathComponent]
+                                 stringByDeletingLastPathComponent]
+                                stringByDeletingLastPathComponent];
+            NSString *p1 = [appDir stringByAppendingPathComponent:@"AudioRecorder"];
+            if (p1.length > 0) [candidates addObject:p1];
+        }
     }
-    return nil;
+
+    // 候选 2：bundleForClass 往上 2 级
+    NSString *clsBundle = [[NSBundle bundleForClass:[ARAutoStartIntentExtensionHandler class]] bundlePath];
+    if (clsBundle.length > 0) {
+        NSString *appDir = [[clsBundle stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
+        NSString *p2 = [appDir stringByAppendingPathComponent:@"AudioRecorder"];
+        if (p2.length > 0 && ![candidates containsObject:p2]) [candidates addObject:p2];
+    }
+
+    // 候选 3：mainBundle 往上 2 级
+    NSString *mainBundle = [[NSBundle mainBundle] bundlePath];
+    if (mainBundle.length > 0) {
+        NSString *appDir = [[mainBundle stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
+        NSString *p3 = [appDir stringByAppendingPathComponent:@"AudioRecorder"];
+        if (p3.length > 0 && ![candidates containsObject:p3]) [candidates addObject:p3];
+    }
+
+    // 候选 4：主 App 写入的 /tmp/.ar_main_exec_path
+    NSString *savedPath = [NSString stringWithContentsOfFile:kARExtMainExecPath
+                                                    encoding:NSUTF8StringEncoding
+                                                       error:nil];
+    if (savedPath.length > 0) {
+        NSString *p4 = [savedPath stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (p4.length > 0 && ![candidates containsObject:p4]) [candidates addObject:p4];
+    }
+
+    NSString *firstNonEmpty = nil;
+    for (NSString *cand in candidates) {
+        if (![cand hasSuffix:@"/AudioRecorder"]) continue;
+        if (!firstNonEmpty) firstNonEmpty = cand;
+
+        errno = 0;
+        int acc = access(cand.UTF8String, X_OK);
+        int accErr = errno;
+        struct stat st;
+        errno = 0;
+        int stRc = stat(cand.UTF8String, &st);
+        int stErr = errno;
+        ARExtLog(@"主程序候选路径: %@ | access(X_OK)=%d(err=%d) stat=%d(err=%d)",
+                 cand, acc, accErr, stRc, stErr);
+        if (acc == 0 || stRc == 0) {
+            return cand;
+        }
+    }
+
+    if (firstNonEmpty) {
+        ARExtLog(@"所有候选 access/stat 未直接通过，保留首个有效拼接路径继续尝试 spawn: %@", firstNonEmpty);
+    }
+    return firstNonEmpty;
 }
 
-static BOOL ARExtSpawnDaemonAsRoot(NSString *execPath) {
+static BOOL ARExtSpawnDaemonAsRoot(NSString *execPath, int *outRc, pid_t *outPid) {
+    if (outRc) *outRc = -1;
+    if (outPid) *outPid = -1;
     if (!execPath || execPath.length == 0) {
         ARExtLog(@"拉起守护进程失败：未找到主程序可执行文件");
+        if (outRc) *outRc = ENOENT;
         return NO;
     }
 
     posix_spawnattr_t attr;
     if (posix_spawnattr_init(&attr) != 0) {
+        int err = errno;
+        if (outRc) *outRc = err;
         return NO;
     }
 
+    // 完全对齐原版 0x10008820c 的属性设置顺序与 envp=NULL
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
     posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
     posix_spawnattr_set_persona_uid_np(&attr, 0);
     posix_spawnattr_set_persona_gid_np(&attr, 0);
-    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
     posix_spawnattr_setpgroup(&attr, 0);
 
     const char *cPath = execPath.UTF8String;
     char *argv[] = {(char *)cPath, (char *)"daemon", NULL};
     pid_t childPid = -1;
-    int rc = posix_spawn(&childPid, cPath, NULL, &attr, argv, environ);
+    int rc = posix_spawn(&childPid, cPath, NULL, &attr, argv, NULL);
     posix_spawnattr_destroy(&attr);
 
     if (rc == 0 && childPid > 0) {
+        if (outRc) *outRc = 0;
+        if (outPid) *outPid = childPid;
         ARExtLog(@"成功以 root persona 拉起守护进程 pid=%d path=%@", childPid, execPath);
         return YES;
     }
 
-    ARExtLog(@"root persona 拉起失败 rc=%d，尝试普通 posix_spawn 兜底", rc);
-    rc = posix_spawn(&childPid, cPath, NULL, NULL, argv, environ);
-    ARExtLog(@"普通 posix_spawn 结果 rc=%d pid=%d", rc, childPid);
-    return (rc == 0 && childPid > 0);
+    ARExtLog(@"root persona 拉起失败 rc=%d (%s)，尝试普通 posix_spawn 兜底", rc, strerror(rc));
+    int rc2 = posix_spawn(&childPid, cPath, NULL, NULL, argv, NULL);
+    ARExtLog(@"普通 posix_spawn 结果 rc=%d (%s) pid=%d", rc2, strerror(rc2), childPid);
+    if (rc2 == 0 && childPid > 0) {
+        if (outRc) *outRc = 0;
+        if (outPid) *outPid = childPid;
+        return YES;
+    }
+
+    if (outRc) *outRc = (rc != 0 ? rc : rc2);
+    return NO;
 }
 
 static BOOL ARExtEnsureDaemonRunning(NSString *__autoreleasing *outMsg) {
     int64_t bootTime = ARExtGetSystemBootTimeSeconds();
-    pid_t existingPid = ARExtFindRunningDaemonPID();
+    NSString *source = nil;
+    pid_t existingPid = ARExtFindRunningDaemonPID(&source);
 
     if (existingPid > 0) {
         if (![[NSFileManager defaultManager] fileExistsAtPath:kARExtDefaultsTmpPath]) {
@@ -244,18 +386,26 @@ static BOOL ARExtEnsureDaemonRunning(NSString *__autoreleasing *outMsg) {
         if (outMsg) {
             *outMsg = [NSString stringWithFormat:@"通话录音守护进程已在运行中 (PID %d)", existingPid];
         }
-        ARExtLog(@"跳过拉起：守护进程已存活 pid=%d bootTime=%lld", existingPid, bootTime);
+        ARExtLog(@"跳过拉起：守护进程已存活 pid=%d source=%@ bootTime=%lld", existingPid, source, bootTime);
         return YES;
     }
 
     NSString *execPath = ARExtMainExecutablePath();
     ARExtLog(@"检测到守护进程未运行（bootTime=%lld），正在后台拉起 path=%@", bootTime, execPath);
     ARExtSyncPreferencesToTmp();
-    BOOL spawned = ARExtSpawnDaemonAsRoot(execPath);
+    int spawnRc = 0;
+    pid_t childPid = -1;
+    BOOL spawned = ARExtSpawnDaemonAsRoot(execPath, &spawnRc, &childPid);
     if (spawned) {
         NSString *marker = [NSString stringWithFormat:@"%lld\n", bootTime];
         [marker writeToFile:kARExtBootAlivePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
         chmod(kARExtBootAlivePath.UTF8String, 0666);
+
+        if (childPid > 0) {
+            NSString *pidStr = [NSString stringWithFormat:@"%d %lld\n", childPid, bootTime];
+            [pidStr writeToFile:kARExtDaemonPidPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            chmod(kARExtDaemonPidPath.UTF8String, 0666);
+        }
 
         if (outMsg) {
             *outMsg = @"检测到重启后守护进程未启动，已在后台静默恢复通话录音";
@@ -264,13 +414,10 @@ static BOOL ARExtEnsureDaemonRunning(NSString *__autoreleasing *outMsg) {
     }
 
     if (outMsg) {
-        *outMsg = @"后台拉起守护进程失败，请手动打开一次通话录音";
+        *outMsg = [NSString stringWithFormat:@"后台拉起失败(rc=%d)，请查看 /tmp/ar_enhance.log", spawnRc];
     }
     return NO;
 }
-
-@interface ARAutoStartIntentExtensionHandler : INExtension <EnsureDaemonIntentHandling>
-@end
 
 @implementation ARAutoStartIntentExtensionHandler
 

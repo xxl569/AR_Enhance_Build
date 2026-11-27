@@ -20,6 +20,7 @@
 #import <spawn.h>
 #import <unistd.h>
 #import <signal.h>
+#import <errno.h>
 #import <string.h>
 
 // ============================================================================
@@ -52,6 +53,8 @@ extern "C" {
 static NSString *const kARSuiteName            = @"net.limneos.audiorecorder";
 static NSString *const kARDefaultsTmpPath      = @"/tmp/.audioRecDefaults";
 static NSString *const kARBootAlivePath        = @"/tmp/.ar_enhance_boot_alive";
+static NSString *const kARDaemonPidPath        = @"/tmp/.ar_daemon_pid";
+static NSString *const kARMainExecPath         = @"/tmp/.ar_main_exec_path";
 static NSString *const kARLogPath              = @"/tmp/ar_enhance.log";
 static NSString *const kARQQProbeLogPath       = @"/tmp/ar_qq_probe.log";
 static NSString *const kQQBundleID             = @"com.tencent.mqq";
@@ -200,6 +203,61 @@ static BOOL ARProcessHasDaemonArg(pid_t pid) {
 }
 
 static pid_t ARFindRunningDaemonPID(void) {
+    pid_t selfPid = getpid();
+    int64_t bootTime = ARGetSystemBootTimeSeconds();
+
+    // 一级：读取 /tmp/.ar_daemon_pid + kill(0) + KERN_PROC_PID 校验 p_comm
+    NSString *pidInfo = [NSString stringWithContentsOfFile:kARDaemonPidPath
+                                                  encoding:NSUTF8StringEncoding
+                                                     error:nil];
+    if (pidInfo.length > 0) {
+        NSArray<NSString *> *parts = [[pidInfo stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]
+                                      componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (parts.count >= 2) {
+            pid_t recPid = (pid_t)[parts[0] intValue];
+            int64_t recBoot = [parts[1] longLongValue];
+            if (recPid > 1 && recPid != selfPid && recBoot == bootTime) {
+                errno = 0;
+                if (kill(recPid, 0) == 0 || errno == EPERM) {
+                    struct kinfo_proc kp;
+                    memset(&kp, 0, sizeof(kp));
+                    size_t klen = sizeof(kp);
+                    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, recPid};
+                    if (sysctl(mib, 4, &kp, &klen, NULL, 0) == 0 && klen >= sizeof(kp)) {
+                        if (strncmp(kp.kp_proc.p_comm, "AudioRecorder", 13) == 0) {
+                            return recPid;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 二级：KERN_PROC_ALL 全局扫描 p_comm == "AudioRecorder" 且 e_ucred.cr_uid == 0
+    int mibAll[3] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL};
+    size_t ksize = 0;
+    if (sysctl(mibAll, 3, NULL, &ksize, NULL, 0) == 0 && ksize > 0) {
+        size_t allocSize = ksize + sizeof(struct kinfo_proc) * 16;
+        struct kinfo_proc *klist = (struct kinfo_proc *)malloc(allocSize);
+        if (klist) {
+            size_t actualSize = allocSize;
+            if (sysctl(mibAll, 3, klist, &actualSize, NULL, 0) == 0 && actualSize >= sizeof(struct kinfo_proc)) {
+                size_t n = actualSize / sizeof(struct kinfo_proc);
+                for (size_t i = 0; i < n; i++) {
+                    pid_t pid = klist[i].kp_proc.p_pid;
+                    if (pid <= 1 || pid == selfPid) continue;
+                    if (strncmp(klist[i].kp_proc.p_comm, "AudioRecorder", 13) == 0 &&
+                        klist[i].kp_eproc.e_ucred.cr_uid == 0) {
+                        free(klist);
+                        return pid;
+                    }
+                }
+            }
+            free(klist);
+        }
+    }
+
+    // 三级：proc_listpids + proc_pidpath + KERN_PROCARGS2 兜底
     int byteCount = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
     if (byteCount <= 0) return -1;
     int cap = (byteCount / (int)sizeof(pid_t)) + 64;
@@ -208,7 +266,6 @@ static pid_t ARFindRunningDaemonPID(void) {
 
     int actualBytes = proc_listpids(PROC_ALL_PIDS, 0, pids, cap * (int)sizeof(pid_t));
     int count = actualBytes / (int)sizeof(pid_t);
-    pid_t selfPid = getpid();
     pid_t result = -1;
 
     char pathBuf[PROC_PIDPATHINFO_MAXSIZE];
@@ -301,7 +358,7 @@ static BOOL ARSpawnDaemonAsRoot(void) {
     const char *cPath = execPath.UTF8String;
     char *argv[] = {(char *)cPath, (char *)"daemon", NULL};
     pid_t childPid = -1;
-    int rc = posix_spawn(&childPid, cPath, NULL, &attr, argv, environ);
+    int rc = posix_spawn(&childPid, cPath, NULL, &attr, argv, NULL);
     posix_spawnattr_destroy(&attr);
 
     if (rc == 0 && childPid > 0) {
@@ -311,7 +368,7 @@ static BOOL ARSpawnDaemonAsRoot(void) {
 
     // 若 persona 失败，尝试普通 posix_spawn 兜底
     ARLog(@"root persona 拉起失败 rc=%d，尝试普通 posix_spawn 兜底", rc);
-    rc = posix_spawn(&childPid, cPath, NULL, NULL, argv, environ);
+    rc = posix_spawn(&childPid, cPath, NULL, NULL, argv, NULL);
     ARLog(@"普通 posix_spawn 结果 rc=%d pid=%d", rc, childPid);
     return (rc == 0 && childPid > 0);
 }
@@ -1404,6 +1461,11 @@ static void AREnhanceInit(void) {
 
         if (ARIsDaemonProcess()) {
             ARLog(@"AREnhance.dylib 已加载至 daemon 守护进程");
+            // 记录当前开机周期与守护进程 PID，供非 root 扩展零权限秒级验活
+            NSString *pidInfo = [NSString stringWithFormat:@"%d %lld\n", getpid(), ARGetSystemBootTimeSeconds()];
+            [pidInfo writeToFile:kARDaemonPidPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            chmod(kARDaemonPidPath.UTF8String, 0666);
+
             // 确保守护进程启动时 /tmp/.audioRecDefaults 含 QQ 默认设置
             if (![[NSFileManager defaultManager] fileExistsAtPath:kARDefaultsTmpPath]) {
                 ARSyncPreferencesToTmp();
@@ -1415,7 +1477,12 @@ static void AREnhanceInit(void) {
             return;
         }
 
-        // 主 App 进程：安装静默 URL 路由与 QQ 设置页注入
+        // 主 App 进程：记录主程序绝对路径供扩展兜底使用，安装静默 URL 路由与 QQ 设置页注入
+        NSString *mainExec = [[NSBundle mainBundle] executablePath];
+        if (mainExec.length > 0) {
+            [mainExec writeToFile:kARMainExecPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            chmod(kARMainExecPath.UTF8String, 0666);
+        }
         ARLog(@"AREnhance.dylib 已加载至主 App 进程");
 
         Class appCls = NSClassFromString(@"AudioRecorderApplication");
