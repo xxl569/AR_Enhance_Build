@@ -8,7 +8,6 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <Intents/Intents.h>
 #import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -22,8 +21,6 @@
 #import <unistd.h>
 #import <signal.h>
 #import <string.h>
-
-#import "EnsureDaemonIntent.h"
 
 // ============================================================================
 // 私有系统 C API 声明（仅依赖标准 libSystem，无第三方头文件依赖）
@@ -366,68 +363,8 @@ static BOOL AREnsureDaemonRunning(NSString *__autoreleasing *outMessage) {
 }
 
 // ============================================================================
-// 模块 2：SiriKit In-App Intent 后台处理器（零闪屏）+ 静默 URL 保底
+// 模块 2：静默 URL 保底唤醒与后台唤醒保护（SiriKit Intent 已交由独立 .appex 扩展处理）
 // ============================================================================
-
-@interface AREnsureDaemonIntentHandler : NSObject <EnsureDaemonIntentHandling>
-@end
-
-@implementation AREnsureDaemonIntentHandler
-
-- (void)handleEnsureDaemon:(EnsureDaemonIntent *)intent
-                completion:(void (^)(EnsureDaemonIntentResponse *response))completion {
-    ARLog(@"收到 SiriKit 后台 Intent 调用：EnsureDaemonIntent");
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSString *statusMsg = nil;
-        BOOL ok = AREnsureDaemonRunning(&statusMsg);
-        EnsureDaemonIntentResponseCode code = ok ? EnsureDaemonIntentResponseCodeSuccess : EnsureDaemonIntentResponseCodeFailure;
-        EnsureDaemonIntentResponse *resp = [[EnsureDaemonIntentResponse alloc] initWithCode:code userActivity:nil];
-        resp.statusMessage = statusMsg ?: (ok ? @"已生效" : @"拉起失败");
-        if (completion) {
-            completion(resp);
-        }
-    });
-}
-
-@end
-
-// 主 App 启动后主动向系统 siriactionsd 捐赠快捷指令动作，确保在“快捷指令”App 中立即可搜到
-static void ARDonateEnsureDaemonShortcut(void) {
-    @autoreleasepool {
-        @try {
-            EnsureDaemonIntent *intent = [[EnsureDaemonIntent alloc] init];
-            intent.suggestedInvocationPhrase = @"检查并恢复通话录音";
-            INInteraction *interaction = [[INInteraction alloc] initWithIntent:intent response:nil];
-            [interaction donateInteractionWithCompletion:^(NSError * _Nullable error) {
-                if (error) {
-                    ARLog(@"捐赠 EnsureDaemonIntent 失败：%@", error);
-                } else {
-                    ARLog(@"已向系统成功捐赠 EnsureDaemonIntent");
-                }
-            }];
-            INShortcut *shortcut = [[INShortcut alloc] initWithIntent:intent];
-            if (shortcut) {
-                [[INVoiceShortcutCenter sharedCenter] setShortcutSuggestions:@[shortcut]];
-                ARLog(@"已向 INVoiceShortcutCenter 注册 EnsureDaemonIntent 建议动作");
-            }
-        } @catch (NSException *ex) {
-            ARLog(@"捐赠快捷指令异常：%@", ex);
-        }
-    }
-}
-
-// 动态挂到 AudioRecorderApplication 的 handlerForIntent:
-static id AR_application_handlerForIntent(id self, SEL _cmd, UIApplication *application, INIntent *intent) {
-    if ([intent isKindOfClass:[EnsureDaemonIntent class]]) {
-        static AREnsureDaemonIntentHandler *handler = nil;
-        static dispatch_once_t onceToken;
-        dispatch_once(&onceToken, ^{
-            handler = [[AREnsureDaemonIntentHandler alloc] init];
-        });
-        return handler;
-    }
-    return nil;
-}
 
 static BOOL (*orig_openURL_legacy)(id, SEL, UIApplication *, NSURL *, NSString *, id) = NULL;
 static void (*orig_app_recStart)(id, SEL) = NULL;
@@ -1478,16 +1415,12 @@ static void AREnhanceInit(void) {
             return;
         }
 
-        // 主 App 进程：安装 SiriKit Intent、静默 URL 路由与 QQ 设置页注入
+        // 主 App 进程：安装静默 URL 路由与 QQ 设置页注入
         ARLog(@"AREnhance.dylib 已加载至主 App 进程");
 
         Class appCls = NSClassFromString(@"AudioRecorderApplication");
         if (appCls) {
-            // 1. 挂载 SiriKit In-App Intent 后台处理入口
-            SEL intentSel = @selector(application:handlerForIntent:);
-            ARSwizzleMethod(appCls, intentSel, (IMP)AR_application_handlerForIntent, NULL, "@@:@@");
-
-            // 2. 挂载静默 URL Scheme 保底入口 (audiorecorder://autostart)
+            // 1. 挂载静默 URL Scheme 保底入口 (audiorecorder://autostart)
             SEL legacyUrlSel = @selector(application:openURL:sourceApplication:annotation:);
             ARSwizzleMethod(appCls, legacyUrlSel, (IMP)hook_openURL_legacy, (IMP *)&orig_openURL_legacy, "B@:@@@@");
 
@@ -1496,7 +1429,7 @@ static void AREnhanceInit(void) {
                 class_addMethod(appCls, modernUrlSel, (IMP)hook_openURL_options, "B@:@@@");
             }
 
-            // 3. 拦截后台冷启时的 recStart，防止误杀正在通话录音中的守护进程
+            // 2. 拦截后台冷启时的 recStart，防止误杀正在通话录音中的守护进程
             ARSwizzleMethod(appCls, NSSelectorFromString(@"recStart"),
                             (IMP)hook_app_recStart, (IMP *)&orig_app_recStart, "v@:");
         }
@@ -1521,11 +1454,5 @@ static void AREnhanceInit(void) {
             ARSwizzleMethod(tableCls, NSSelectorFromString(@"generateAppIcons"),
                             (IMP)hook_table_generateAppIcons, (IMP *)&orig_table_generateAppIcons, "v@:");
         }
-
-        // 5. 延迟主动向系统捐赠后台快捷指令动作，让“快捷指令”App 立即可检索到
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            ARDonateEnsureDaemonShortcut();
-        });
     }
 }

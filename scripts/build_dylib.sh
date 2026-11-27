@@ -47,20 +47,39 @@ xcrun --sdk iphoneos clang++ \
   -fobjc-arc \
   -O2 \
   -Wall -Wno-deprecated-declarations \
-  -I"$GEN_DIR" \
   -install_name "@executable_path/AREnhance.dylib" \
   -framework Foundation \
   -framework UIKit \
-  -framework Intents \
   -framework AVFoundation \
   -framework CoreFoundation \
   -lobjc \
-  "$GEN_DIR/EnsureDaemonIntent.m" \
   "$ROOT_DIR/src/AREnhance.mm" \
   -o "$OUT_DIR/AREnhance.dylib"
 
 file "$OUT_DIR/AREnhance.dylib"
 otool -L "$OUT_DIR/AREnhance.dylib"
+
+echo "=== 编译 ARM64 ARAutoStartIntents (.appex 可执行文件) ==="
+xcrun --sdk iphoneos clang++ \
+  -arch arm64 \
+  -isysroot "$SDK_PATH" \
+  -miphoneos-version-min=14.0 \
+  -fobjc-arc \
+  -fapplication-extension \
+  -O2 \
+  -Wall -Wno-deprecated-declarations \
+  -e _NSExtensionMain \
+  -I"$GEN_DIR" \
+  -framework Foundation \
+  -framework Intents \
+  -lobjc \
+  "$GEN_DIR/EnsureDaemonIntent.m" \
+  "$ROOT_DIR/src/ARAutoStartIntentExtension.mm" \
+  -o "$OUT_DIR/ARAutoStartIntents"
+
+file "$OUT_DIR/ARAutoStartIntents"
+otool -L "$OUT_DIR/ARAutoStartIntents"
+nm -u "$OUT_DIR/ARAutoStartIntents" | grep NSExtensionMain
 
 mkdir -p "$OUT_DIR/intent_resources"
 echo "=== intentbuilderc compile 产物清单 ==="
