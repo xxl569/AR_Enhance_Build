@@ -22,14 +22,17 @@ if [ -n "$INTENT_BUILDER" ]; then
     -language Objective-C \
     -classPrefix AR \
     -visibility public \
-    -swiftVersion 5.0 || true
+    -swiftVersion 5.0
 
   mkdir -p "$GEN_DIR/compiled"
+  "$INTENT_BUILDER" compile -help 2>&1 || true
   "$INTENT_BUILDER" compile \
     -input "$ROOT_DIR/src/ARAutoStart.intentdefinition" \
     -output "$GEN_DIR/compiled" \
-    -platform ios \
-    -deploymentTarget 14.0 || true
+    -outputFormat binary || \
+  "$INTENT_BUILDER" compile \
+    -input "$ROOT_DIR/src/ARAutoStart.intentdefinition" \
+    -output "$GEN_DIR/compiled"
 fi
 
 if [ ! -f "$GEN_DIR/AREnsureDaemonIntent.h" ]; then
