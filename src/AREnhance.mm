@@ -8,6 +8,7 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <Intents/Intents.h>
 #import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -22,6 +23,8 @@
 #import <signal.h>
 #import <errno.h>
 #import <string.h>
+
+#import "EnsureDaemonIntent.h"
 
 // ============================================================================
 // 私有系统 C API 声明（仅依赖标准 libSystem，无第三方头文件依赖）
@@ -1465,32 +1468,25 @@ static void ARWriteDaemonPong(void) {
     }
 }
 
-// 一次性清理旧版 v4 主 App 遗留的 SiriKit 捐赠缓存，避免快捷指令重复显示两条动作
-static void ARClearLegacyShortcutDonations(void) {
+// 清理旧 INInteraction 重复捐赠，并仅向 INVoiceShortcutCenter 注册唯一 1 个 EnsureDaemonIntent 建议动作
+// （主 App Info.plist 不写 INIntentsSupported，实际执行 100% 路由至 PlugIns/ARAutoStartIntents.appex）
+static void ARRegisterSingleShortcutSuggestion(void) {
     @autoreleasepool {
         @try {
-            dlopen("/System/Library/Frameworks/Intents.framework/Intents", RTLD_LAZY);
-            Class interCls = NSClassFromString(@"INInteraction");
-            SEL delSel = NSSelectorFromString(@"deleteAllInteractionsWithCompletion:");
-            if (interCls && [interCls respondsToSelector:delSel]) {
-                void (^comp)(NSError *) = ^(NSError *error) {
-                    if (error) {
-                        ARLog(@"清理旧 INInteraction 失败：%@", error);
-                    }
-                };
-                ((void (*)(id, SEL, id))objc_msgSend)(interCls, delSel, comp);
-            }
-            Class centerCls = NSClassFromString(@"INVoiceShortcutCenter");
-            SEL sharedSel = NSSelectorFromString(@"sharedCenter");
-            SEL setSugSel = NSSelectorFromString(@"setShortcutSuggestions:");
-            if (centerCls && [centerCls respondsToSelector:sharedSel]) {
-                id center = ((id (*)(id, SEL))objc_msgSend)(centerCls, sharedSel);
-                if (center && [center respondsToSelector:setSugSel]) {
-                    ((void (*)(id, SEL, id))objc_msgSend)(center, setSugSel, @[]);
+            [INInteraction deleteAllInteractionsWithCompletion:^(NSError * _Nullable error) {
+                if (error) {
+                    ARLog(@"清理旧 INInteraction 失败：%@", error);
                 }
+            }];
+            EnsureDaemonIntent *intent = [[EnsureDaemonIntent alloc] init];
+            intent.suggestedInvocationPhrase = @"检查并恢复通话录音";
+            INShortcut *shortcut = [[INShortcut alloc] initWithIntent:intent];
+            if (shortcut) {
+                [[INVoiceShortcutCenter sharedCenter] setShortcutSuggestions:@[shortcut]];
+                ARLog(@"已注册唯一 EnsureDaemonIntent 建议动作（清除旧 INInteraction 避免重复）");
             }
         } @catch (NSException *ex) {
-            ARLog(@"清理旧捐赠缓存异常：%@", ex);
+            ARLog(@"注册唯一快捷指令建议异常：%@", ex);
         }
     }
 }
@@ -1589,10 +1585,10 @@ static void AREnhanceInit(void) {
                             (IMP)hook_table_generateAppIcons, (IMP *)&orig_table_generateAppIcons, "v@:");
         }
 
-        // 5. 延迟清理旧版 v4 残留的重复快捷指令捐赠缓存
+        // 5. 延迟清理旧重复捐赠并注册唯一 1 个 EnsureDaemonIntent 建议动作
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            ARClearLegacyShortcutDonations();
+            ARRegisterSingleShortcutSuggestion();
         });
     }
 }

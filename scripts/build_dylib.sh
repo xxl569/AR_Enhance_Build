@@ -47,12 +47,15 @@ xcrun --sdk iphoneos clang++ \
   -fobjc-arc \
   -O2 \
   -Wall -Wno-deprecated-declarations \
+  -I"$GEN_DIR" \
   -install_name "@executable_path/AREnhance.dylib" \
   -framework Foundation \
   -framework UIKit \
+  -framework Intents \
   -framework AVFoundation \
   -framework CoreFoundation \
   -lobjc \
+  "$GEN_DIR/EnsureDaemonIntent.m" \
   "$ROOT_DIR/src/AREnhance.mm" \
   -o "$OUT_DIR/AREnhance.dylib"
 
