@@ -23,7 +23,7 @@
 #import <signal.h>
 #import <string.h>
 
-#import "AREnsureDaemonIntent.h"
+#import "EnsureDaemonIntent.h"
 
 // ============================================================================
 // 私有系统 C API 声明（仅依赖标准 libSystem，无第三方头文件依赖）
@@ -369,19 +369,19 @@ static BOOL AREnsureDaemonRunning(NSString *__autoreleasing *outMessage) {
 // 模块 2：SiriKit In-App Intent 后台处理器（零闪屏）+ 静默 URL 保底
 // ============================================================================
 
-@interface AREnsureDaemonIntentHandler : NSObject <AREnsureDaemonIntentHandling>
+@interface AREnsureDaemonIntentHandler : NSObject <EnsureDaemonIntentHandling>
 @end
 
 @implementation AREnsureDaemonIntentHandler
 
-- (void)handleEnsureDaemon:(AREnsureDaemonIntent *)intent
-                completion:(void (^)(AREnsureDaemonIntentResponse *response))completion {
-    ARLog(@"收到 SiriKit 后台 Intent 调用：AREnsureDaemonIntent");
+- (void)handleEnsureDaemon:(EnsureDaemonIntent *)intent
+                completion:(void (^)(EnsureDaemonIntentResponse *response))completion {
+    ARLog(@"收到 SiriKit 后台 Intent 调用：EnsureDaemonIntent");
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSString *statusMsg = nil;
         BOOL ok = AREnsureDaemonRunning(&statusMsg);
-        AREnsureDaemonIntentResponseCode code = ok ? AREnsureDaemonIntentResponseCodeSuccess : AREnsureDaemonIntentResponseCodeFailure;
-        AREnsureDaemonIntentResponse *resp = [[AREnsureDaemonIntentResponse alloc] initWithCode:code userActivity:nil];
+        EnsureDaemonIntentResponseCode code = ok ? EnsureDaemonIntentResponseCodeSuccess : EnsureDaemonIntentResponseCodeFailure;
+        EnsureDaemonIntentResponse *resp = [[EnsureDaemonIntentResponse alloc] initWithCode:code userActivity:nil];
         resp.statusMessage = statusMsg ?: (ok ? @"已生效" : @"拉起失败");
         if (completion) {
             completion(resp);
@@ -391,9 +391,34 @@ static BOOL AREnsureDaemonRunning(NSString *__autoreleasing *outMessage) {
 
 @end
 
+// 主 App 启动后主动向系统 siriactionsd 捐赠快捷指令动作，确保在“快捷指令”App 中立即可搜到
+static void ARDonateEnsureDaemonShortcut(void) {
+    @autoreleasepool {
+        @try {
+            EnsureDaemonIntent *intent = [[EnsureDaemonIntent alloc] init];
+            intent.suggestedInvocationPhrase = @"检查并恢复通话录音";
+            INInteraction *interaction = [[INInteraction alloc] initWithIntent:intent response:nil];
+            [interaction donateInteractionWithCompletion:^(NSError * _Nullable error) {
+                if (error) {
+                    ARLog(@"捐赠 EnsureDaemonIntent 失败：%@", error);
+                } else {
+                    ARLog(@"已向系统成功捐赠 EnsureDaemonIntent");
+                }
+            }];
+            INShortcut *shortcut = [[INShortcut alloc] initWithIntent:intent];
+            if (shortcut) {
+                [[INVoiceShortcutCenter sharedCenter] setShortcutSuggestions:@[shortcut]];
+                ARLog(@"已向 INVoiceShortcutCenter 注册 EnsureDaemonIntent 建议动作");
+            }
+        } @catch (NSException *ex) {
+            ARLog(@"捐赠快捷指令异常：%@", ex);
+        }
+    }
+}
+
 // 动态挂到 AudioRecorderApplication 的 handlerForIntent:
 static id AR_application_handlerForIntent(id self, SEL _cmd, UIApplication *application, INIntent *intent) {
-    if ([intent isKindOfClass:[AREnsureDaemonIntent class]]) {
+    if ([intent isKindOfClass:[EnsureDaemonIntent class]]) {
         static AREnsureDaemonIntentHandler *handler = nil;
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
@@ -1496,5 +1521,11 @@ static void AREnhanceInit(void) {
             ARSwizzleMethod(tableCls, NSSelectorFromString(@"generateAppIcons"),
                             (IMP)hook_table_generateAppIcons, (IMP *)&orig_table_generateAppIcons, "v@:");
         }
+
+        // 5. 延迟主动向系统捐赠后台快捷指令动作，让“快捷指令”App 立即可检索到
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            ARDonateEnsureDaemonShortcut();
+        });
     }
 }
