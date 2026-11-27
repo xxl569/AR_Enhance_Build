@@ -56,6 +56,7 @@ static NSString *const kARSuiteName            = @"net.limneos.audiorecorder";
 static NSString *const kARDefaultsTmpPath      = @"/tmp/.audioRecDefaults";
 static NSString *const kARBootAlivePath        = @"/tmp/.ar_enhance_boot_alive";
 static NSString *const kARLogPath              = @"/tmp/ar_enhance.log";
+static NSString *const kARQQProbeLogPath       = @"/tmp/ar_qq_probe.log";
 static NSString *const kQQBundleID             = @"com.tencent.mqq";
 static NSString *const kQQDisplayName          = @"QQ";
 
@@ -570,6 +571,351 @@ static void hook_appOpt_setAutoRecord(id self, SEL _cmd, id value, id specifier)
 }
 
 // ============================================================================
+// 模块 3.5：首页录音列表补齐 QQ 应用小图标（AudioRecorderTableController）
+// ============================================================================
+
+static void (*orig_table_generateAppIcons)(id, SEL) = NULL;
+
+static void hook_table_generateAppIcons(id self, SEL _cmd) {
+    if (orig_table_generateAppIcons) {
+        orig_table_generateAppIcons(self, _cmd);
+    }
+    @try {
+        Ivar dictIv = class_getInstanceVariable([self class], "imageDict");
+        if (!dictIv) return;
+        id imgDictObj = object_getIvar(self, dictIv);
+        if (![imgDictObj isKindOfClass:[NSMutableDictionary class]]) return;
+        NSMutableDictionary *imgDict = (NSMutableDictionary *)imgDictObj;
+
+        int iconFmt = 0;
+        Ivar fmtIv = class_getInstanceVariable([self class], "appIconFormat");
+        if (fmtIv) {
+            ptrdiff_t offset = ivar_getOffset(fmtIv);
+            iconFmt = *(int *)((uint8_t *)(__bridge void *)self + offset);
+        }
+
+        SEL iconSel = NSSelectorFromString(@"_applicationIconImageForBundleIdentifier:format:");
+        UIImage *qqIcon = nil;
+        if ([UIImage respondsToSelector:iconSel]) {
+            qqIcon = ((UIImage *(*)(id, SEL, NSString *, int))objc_msgSend)([UIImage class], iconSel, kQQBundleID, iconFmt);
+            if (!qqIcon && iconFmt != 0) {
+                qqIcon = ((UIImage *(*)(id, SEL, NSString *, int))objc_msgSend)([UIImage class], iconSel, kQQBundleID, 0);
+            }
+        }
+        if (qqIcon) {
+            imgDict[kQQDisplayName] = qqIcon;
+            imgDict[@"QQAudio"] = qqIcon;
+            imgDict[@"QQVideo"] = qqIcon;
+            imgDict[kQQBundleID] = qqIcon;
+            ARLog(@"已向首页录音列表 imageDict 注入 QQ 小图标 (format=%d)", iconFmt);
+        }
+    } @catch (NSException *ex) {
+        ARLog(@"注入 QQ 小图标异常：%@", ex);
+    }
+}
+
+// ============================================================================
+// 模块 3.8：多源 QQ 对方号码提取器 + 本地只读诊断探针 (/tmp/ar_qq_probe.log)
+// ============================================================================
+
+static BOOL ARIsLikelyTimestampOrInvalidUin(NSString *numStr, time_t nowSec) {
+    if (numStr.length < 5 || numStr.length > 11) return YES;
+    long long v = [numStr longLongValue];
+    if (v < 10000LL) return YES;
+    // 排除当前秒级/毫秒级 Unix 时间戳（误差 7 天内）
+    if (numStr.length == 10 && llabs(v - (long long)nowSec) < 86400LL * 30LL) return YES;
+    // 排除 YYYYMMDD / YYYYMMDDHH 日期串（如 20261127）
+    if (numStr.length >= 8 && ([numStr hasPrefix:@"202"] || [numStr hasPrefix:@"201"] || [numStr hasPrefix:@"197"])) {
+        if (numStr.length == 8 || numStr.length == 10) return YES;
+    }
+    return NO;
+}
+
+static void ARCollectQQContainers(NSString *__autoreleasing *outDataPath, NSArray<NSString *> *__autoreleasing *outGroupPaths) {
+    dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_NOW);
+    dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_NOW);
+    Class proxyCls = NSClassFromString(@"LSApplicationProxy");
+    if (!proxyCls) return;
+    SEL sel = NSSelectorFromString(@"applicationProxyForIdentifier:");
+    if (![proxyCls respondsToSelector:sel]) return;
+    id proxy = ((id (*)(id, SEL, id))objc_msgSend)(proxyCls, sel, kQQBundleID);
+    if (!proxy) return;
+
+    SEL dataUrlSel = NSSelectorFromString(@"dataContainerURL");
+    if ([proxy respondsToSelector:dataUrlSel]) {
+        NSURL *u = ((NSURL *(*)(id, SEL))objc_msgSend)(proxy, dataUrlSel);
+        if (u.path.length > 0 && outDataPath) *outDataPath = u.path;
+    }
+
+    SEL grpUrlSel = NSSelectorFromString(@"groupContainerURLs");
+    if ([proxy respondsToSelector:grpUrlSel]) {
+        NSDictionary *grps = ((NSDictionary *(*)(id, SEL))objc_msgSend)(proxy, grpUrlSel);
+        if ([grps isKindOfClass:[NSDictionary class]] && outGroupPaths) {
+            NSMutableArray<NSString *> *paths = [NSMutableArray array];
+            for (id val in grps.allValues) {
+                if ([val isKindOfClass:[NSURL class]] && [(NSURL *)val path].length > 0) {
+                    [paths addObject:[(NSURL *)val path]];
+                }
+            }
+            *outGroupPaths = paths;
+        }
+    }
+}
+
+static NSSet<NSString *> *ARDetectSelfQQUins(NSString *qqDataPath, NSArray<NSString *> *groupPaths) {
+    NSMutableSet<NSString *> *selfUins = [NSMutableSet set];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // 1. 从 com.tencent.mqq.plist 读取当前登录 QQ 号
+    if (qqDataPath.length > 0) {
+        NSString *plistPath = [qqDataPath stringByAppendingPathComponent:@"Library/Preferences/com.tencent.mqq.plist"];
+        NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+        if ([prefs isKindOfClass:[NSDictionary class]]) {
+            for (NSString *k in prefs) {
+                NSString *kl = [k lowercaseString];
+                if ([kl containsString:@"selfuin"] || [kl containsString:@"currentuin"] ||
+                    [kl containsString:@"loginuin"] || [kl isEqualToString:@"uin"] ||
+                    [kl containsString:@"account"]) {
+                    id v = prefs[k];
+                    NSString *sv = [v isKindOfClass:[NSNumber class]] ? [v stringValue] : ([v isKindOfClass:[NSString class]] ? v : nil);
+                    if (sv && sv.length >= 5 && sv.length <= 11) {
+                        NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+                        if ([sv rangeOfCharacterFromSet:nonDigits].location == NSNotFound) {
+                            [selfUins addObject:sv];
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Documents/contents/<selfUin> 经典目录
+        NSString *contentsDir = [qqDataPath stringByAppendingPathComponent:@"Documents/contents"];
+        NSArray<NSString *> *subs = [fm contentsOfDirectoryAtPath:contentsDir error:nil];
+        NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+        for (NSString *name in subs) {
+            if (name.length >= 5 && name.length <= 11 &&
+                [name rangeOfCharacterFromSet:nonDigits].location == NSNotFound &&
+                ![name hasPrefix:@"0"]) {
+                [selfUins addObject:name];
+            }
+        }
+    }
+    return selfUins;
+}
+
+static NSString *ARExtractPeerUinFromText(NSString *text, NSSet<NSString *> *selfUins, time_t nowSec) {
+    if (text.length == 0) return nil;
+    // 优先匹配明确的通话对方字段名（取文本最后一次出现，代表最新通话）
+    static NSRegularExpression *explicitRegex = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        explicitRegex = [NSRegularExpression regularExpressionWithPattern:
+            @"(?:peer[_\\s]?uin|friend[_\\s]?uin|from[_\\s]?uin|to[_\\s]?uin|remote[_\\s]?uin|target[_\\s]?uin|caller[_\\s]?uin|call[_\\s]?uin|dst[_\\s]?uin|src[_\\s]?uin|peerId|peer_id|friUin|chatUin)[\"']?\\s*[:=]\\s*[\"']?([1-9][0-9]{4,10})(?![0-9])"
+            options:NSRegularExpressionCaseInsensitive
+            error:nil];
+    });
+    if (!explicitRegex) return nil;
+
+    NSArray<NSTextCheckingResult *> *matches = [explicitRegex matchesInString:text options:0 range:NSMakeRange(0, text.length)];
+    for (NSInteger i = (NSInteger)matches.count - 1; i >= 0; i--) {
+        NSTextCheckingResult *m = matches[(NSUInteger)i];
+        if (m.numberOfRanges >= 2) {
+            NSString *cand = [text substringWithRange:[m rangeAtIndex:1]];
+            if (![selfUins containsObject:cand] && !ARIsLikelyTimestampOrInvalidUin(cand, nowSec)) {
+                return cand;
+            }
+        }
+    }
+    return nil;
+}
+
+static NSString *ARExtractPeerUinFromFilename(NSString *relPath, NSSet<NSString *> *selfUins, time_t nowSec) {
+    NSString *fname = [relPath lastPathComponent];
+    static NSRegularExpression *fnRegex = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // 匹配常见头像/资料/C2C会话缓存文件名中的 QQ 号，例如 123456789.jpg / head_123456789 / uin_123456789 / c2c_123456789
+        fnRegex = [NSRegularExpression regularExpressionWithPattern:
+            @"(?:^|[_\\-/])(?:uin|peer|fri|friend|head|avatar|c2c|av|call|chat|user)?[_\\-]?([1-9][0-9]{4,10})(?:[_\\.\\-]|$)"
+            options:NSRegularExpressionCaseInsensitive
+            error:nil];
+    });
+    if (!fnRegex) return nil;
+
+    // 仅在路径明显与头像/通话/会话相关时才采用文件名推断，避免把随机缓存数字当 QQ 号
+    NSString *low = [relPath lowercaseString];
+    BOOL relevant = ([low containsString:@"head"] || [low containsString:@"avatar"] ||
+                     [low containsString:@"face"] || [low containsString:@"av"] ||
+                     [low containsString:@"voip"] || [low containsString:@"call"] ||
+                     [low containsString:@"c2c"]  || [low containsString:@"friend"] ||
+                     [low containsString:@"uin"]  || [low containsString:@"peer"]);
+    if (!relevant) return nil;
+
+    NSArray<NSTextCheckingResult *> *matches = [fnRegex matchesInString:fname options:0 range:NSMakeRange(0, fname.length)];
+    for (NSTextCheckingResult *m in matches) {
+        if (m.numberOfRanges >= 2) {
+            NSString *cand = [fname substringWithRange:[m rangeAtIndex:1]];
+            if (![selfUins containsObject:cand] && !ARIsLikelyTimestampOrInvalidUin(cand, nowSec)) {
+                return cand;
+            }
+        }
+    }
+    return nil;
+}
+
+static NSString *ARResolveQQPeerUinAndWriteProbe(void) {
+    @autoreleasepool {
+        time_t nowSec = time(NULL);
+        NSString *qqDataPath = nil;
+        NSArray<NSString *> *groupPaths = nil;
+        ARCollectQQContainers(&qqDataPath, &groupPaths);
+        NSSet<NSString *> *selfUins = ARDetectSelfQQUins(qqDataPath, groupPaths);
+
+        NSMutableArray<NSDictionary *> *recentFiles = [NSMutableArray array];
+        NSMutableArray<NSString *> *rootsToScan = [NSMutableArray array];
+        if (qqDataPath.length > 0) {
+            for (NSString *sub in @[@"Library/Caches", @"Documents", @"tmp", @"Library/Application Support"]) {
+                NSString *full = [qqDataPath stringByAppendingPathComponent:sub];
+                if ([[NSFileManager defaultManager] fileExistsAtPath:full]) {
+                    [rootsToScan addObject:full];
+                }
+            }
+        }
+        for (NSString *gp in groupPaths) {
+            if ([[NSFileManager defaultManager] fileExistsAtPath:gp]) {
+                [rootsToScan addObject:gp];
+            }
+        }
+
+        // 快速遍历最近 30 秒内修改过的文件（限深度 <= 4 且总扫描项上限 6000，确保 <100ms 返回）
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSInteger scanned = 0;
+        const NSInteger kMaxScan = 6000;
+        for (NSString *scanRoot in rootsToScan) {
+            NSUInteger rootDepth = [[scanRoot pathComponents] count];
+            NSDirectoryEnumerator *en = [fm enumeratorAtPath:scanRoot];
+            NSString *rel = nil;
+            while ((rel = [en nextObject]) != nil) {
+                if (++scanned > kMaxScan) break;
+                NSString *full = [scanRoot stringByAppendingPathComponent:rel];
+                NSUInteger depth = [[full pathComponents] count] - rootDepth;
+                if (depth > 4) {
+                    [en skipDescendants];
+                    continue;
+                }
+                struct stat st;
+                if (lstat(full.UTF8String, &st) != 0) continue;
+                if (S_ISDIR(st.st_mode)) {
+                    // 跳过明显无关的大型资源目录
+                    NSString *lowName = [rel.lastPathComponent lowercaseString];
+                    if ([lowName isEqualToString:@"webview"] || [lowName isEqualToString:@"miniapp"] ||
+                        [lowName isEqualToString:@"qzone"] || [lowName isEqualToString:@"shortvideo"] ||
+                        [lowName isEqualToString:@"ark"] || [lowName isEqualToString:@"hippy"]) {
+                        [en skipDescendants];
+                    }
+                    continue;
+                }
+                time_t age = nowSec - st.st_mtime;
+                if (age >= -5 && age <= 30) {
+                    NSString *shortRel = qqDataPath.length > 0 && [full hasPrefix:qqDataPath]
+                        ? [@"DATA" stringByAppendingString:[full substringFromIndex:qqDataPath.length]]
+                        : [@"GRP/" stringByAppendingString:rel];
+                    [recentFiles addObject:@{
+                        @"full": full,
+                        @"rel": shortRel,
+                        @"age": @(age),
+                        @"size": @((long long)st.st_size)
+                    }];
+                }
+            }
+            if (scanned > kMaxScan) break;
+        }
+
+        // 按最新修改时间排序
+        [recentFiles sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            return [a[@"age"] compare:b[@"age"]];
+        }];
+
+        NSString *resolvedUin = nil;
+        NSString *resolvedSource = @"none";
+
+        // 通道 1：读取最近修改的文本/日志/plist 尾部（最多检查前 15 个疑似日志文件）
+        NSInteger logChecked = 0;
+        for (NSDictionary *item in recentFiles) {
+            if (logChecked >= 15) break;
+            NSString *full = item[@"full"];
+            NSString *low = [full lowercaseString];
+            long long fsize = [item[@"size"] longLongValue];
+            if (fsize <= 0 || fsize > 64 * 1024 * 1024) continue;
+            BOOL isTextLike = ([low hasSuffix:@".log"] || [low hasSuffix:@".txt"] ||
+                               [low hasSuffix:@".plist"] || [low hasSuffix:@".json"] ||
+                               [low containsString:@"av"] || [low containsString:@"qav"] ||
+                               [low containsString:@"rtc"] || [low containsString:@"voip"]);
+            if (!isTextLike) continue;
+            logChecked++;
+
+            FILE *fp = fopen(full.UTF8String, "rb");
+            if (!fp) continue;
+            long long readLen = fsize > 32768 ? 32768 : fsize;
+            if (fsize > readLen) fseeko(fp, fsize - readLen, SEEK_SET);
+            char *buf = (char *)malloc((size_t)readLen + 1);
+            if (buf) {
+                size_t nr = fread(buf, 1, (size_t)readLen, fp);
+                buf[nr] = '\0';
+                // 把中间可能存在的 \0 替换为空格，方便在部分二进制/混合日志里做正则匹配
+                for (size_t k = 0; k < nr; k++) {
+                    if (buf[k] == '\0') buf[k] = ' ';
+                }
+                NSString *tailText = [[NSString alloc] initWithBytes:buf length:nr encoding:NSISOLatin1StringEncoding];
+                free(buf);
+                NSString *cand = ARExtractPeerUinFromText(tailText, selfUins, nowSec);
+                if (cand) {
+                    resolvedUin = cand;
+                    resolvedSource = [NSString stringWithFormat:@"log:%@", item[@"rel"]];
+                    fclose(fp);
+                    break;
+                }
+            }
+            fclose(fp);
+        }
+
+        // 通道 2：若日志未命中，从最近 25 秒变动的头像/资料/会话文件名中推断
+        if (!resolvedUin) {
+            for (NSDictionary *item in recentFiles) {
+                if ([item[@"age"] integerValue] > 25) break;
+                NSString *cand = ARExtractPeerUinFromFilename(item[@"rel"], selfUins, nowSec);
+                if (cand) {
+                    resolvedUin = cand;
+                    resolvedSource = [NSString stringWithFormat:@"filename:%@", item[@"rel"]];
+                    break;
+                }
+            }
+        }
+
+        // 写入只读诊断探针 /tmp/ar_qq_probe.log（便于后续按用户实际 QQ 版本精准调优）
+        NSMutableString *probe = [NSMutableString string];
+        [probe appendFormat:@"=== QQ Peer Probe @ %ld ===\n", (long)nowSec];
+        [probe appendFormat:@"qqDataPath: %@\n", qqDataPath ?: @"(nil)"];
+        [probe appendFormat:@"groupPaths(%lu): %@\n", (unsigned long)groupPaths.count, groupPaths ?: @[]];
+        [probe appendFormat:@"selfUins: %@\n", selfUins.allObjects];
+        [probe appendFormat:@"resolvedUin: %@ (source=%@)\n", resolvedUin ?: @"(not found)", resolvedSource];
+        [probe appendFormat:@"recentFiles(<=30s, count=%lu, scanned=%ld):\n", (unsigned long)recentFiles.count, (long)scanned];
+        NSUInteger maxShow = MIN(recentFiles.count, (NSUInteger)45);
+        for (NSUInteger i = 0; i < maxShow; i++) {
+            NSDictionary *it = recentFiles[i];
+            [probe appendFormat:@"  [%2lds ago | %8lldB] %@\n",
+             (long)[it[@"age"] integerValue], [it[@"size"] longLongValue], it[@"rel"]];
+        }
+        [probe writeToFile:kARQQProbeLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        chmod(kARQQProbeLogPath.UTF8String, 0666);
+
+        ARLog(@"QQ 对方号码探测完成：uin=%@ source=%@ recentCount=%lu",
+              resolvedUin ?: @"QQCall", resolvedSource, (unsigned long)recentFiles.count);
+        return resolvedUin;
+    }
+}
+
+// ============================================================================
 // 模块 4：守护进程 QQ (com.tencent.mqq) 语音/视频通话智能监听器
 // ============================================================================
 
@@ -783,12 +1129,14 @@ static void hook_appOpt_setAutoRecord(id self, SEL _cmd, id value, id specifier)
         if (startSlot) *startSlot = now;
 
         NSMutableDictionary *info = [NSMutableDictionary dictionary];
+        NSString *peerUin = ARResolveQQPeerUinAndWriteProbe();
+        NSString *displayPeer = (peerUin.length >= 5) ? peerUin : @"QQCall";
         info[@"CallStatus"] = @(1);
         info[@"Application"] = kQQDisplayName;
         info[@"appIdentifier"] = kQQBundleID;
         info[@"EndpointOnCurrentDevice"] = @YES;
-        info[@"Number"] = @"QQCall";
-        info[@"Name"] = kQQDisplayName;
+        info[@"Number"] = displayPeer;
+        info[@"Name"] = displayPeer;
         info[@"isOutgoing"] = @(NO);
         info[@"StartTime"] = @((int)now);
 
@@ -1051,6 +1399,13 @@ static void AREnhanceInit(void) {
         if (appOptCls) {
             ARSwizzleMethod(appOptCls, NSSelectorFromString(@"setAutoRecordAllCalls:specifier:"),
                             (IMP)hook_appOpt_setAutoRecord, (IMP *)&orig_appOpt_setAutoRecord, "v@:@@");
+        }
+
+        // 4. 挂载首页录音列表图标补丁，点亮 QQ 小图标
+        Class tableCls = NSClassFromString(@"AudioRecorderTableController");
+        if (tableCls) {
+            ARSwizzleMethod(tableCls, NSSelectorFromString(@"generateAppIcons"),
+                            (IMP)hook_table_generateAppIcons, (IMP *)&orig_table_generateAppIcons, "v@:");
         }
     }
 }
