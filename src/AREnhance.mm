@@ -1468,9 +1468,10 @@ static void ARWriteDaemonPong(void) {
     }
 }
 
-// 清理旧 INInteraction 重复捐赠，并仅向 INVoiceShortcutCenter 注册唯一 1 个 EnsureDaemonIntent 建议动作
-// （主 App Info.plist 不写 INIntentsSupported，实际执行 100% 路由至 PlugIns/ARAutoStartIntents.appex）
-static void ARRegisterSingleShortcutSuggestion(void) {
+// 彻底清空历史 INInteraction 捐赠与 INVoiceShortcutCenter 动态建议：
+// 仅依靠 ARAutoStart.intentdefinition（INIntentConfigurable=true + INIntentIneligibleForSuggestions=true）
+// 由系统静态索引唯一 1 个动作，杜绝 iOS 16 快捷指令并排显示“静态动作 + 动态建议”两条同名条目
+static void ARClearLegacyShortcutDonations(void) {
     @autoreleasepool {
         @try {
             [INInteraction deleteAllInteractionsWithCompletion:^(NSError * _Nullable error) {
@@ -1478,15 +1479,10 @@ static void ARRegisterSingleShortcutSuggestion(void) {
                     ARLog(@"清理旧 INInteraction 失败：%@", error);
                 }
             }];
-            EnsureDaemonIntent *intent = [[EnsureDaemonIntent alloc] init];
-            intent.suggestedInvocationPhrase = @"检查并恢复通话录音";
-            INShortcut *shortcut = [[INShortcut alloc] initWithIntent:intent];
-            if (shortcut) {
-                [[INVoiceShortcutCenter sharedCenter] setShortcutSuggestions:@[shortcut]];
-                ARLog(@"已注册唯一 EnsureDaemonIntent 建议动作（清除旧 INInteraction 避免重复）");
-            }
+            [[INVoiceShortcutCenter sharedCenter] setShortcutSuggestions:@[]];
+            ARLog(@"已清空旧 INInteraction 与动态快捷指令建议（仅保留静态唯一动作）");
         } @catch (NSException *ex) {
-            ARLog(@"注册唯一快捷指令建议异常：%@", ex);
+            ARLog(@"清理旧快捷指令建议异常：%@", ex);
         }
     }
 }
@@ -1585,10 +1581,10 @@ static void AREnhanceInit(void) {
                             (IMP)hook_table_generateAppIcons, (IMP *)&orig_table_generateAppIcons, "v@:");
         }
 
-        // 5. 延迟清理旧重复捐赠并注册唯一 1 个 EnsureDaemonIntent 建议动作
+        // 5. 延迟清空历史重复捐赠与动态建议，仅保留静态唯一 EnsureDaemonIntent 动作
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            ARRegisterSingleShortcutSuggestion();
+            ARClearLegacyShortcutDonations();
         });
     }
 }

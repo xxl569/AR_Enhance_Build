@@ -28,7 +28,7 @@
 			<key>INIntentEligibleForWidgets</key>
 			<false/>
 			<key>INIntentIneligibleForSuggestions</key>
-			<false/>
+			<true/>
 			<key>INIntentLastParameterTag</key>
 			<integer>1</integer>
 			<key>INIntentName</key>
