@@ -118,10 +118,14 @@ file "$OUT_DIR/AREnhance.dylib"
 otool -L "$OUT_DIR/AREnhance.dylib"
 
 mkdir -p "$OUT_DIR/intent_resources"
+echo "=== intentbuilderc compile 产物清单 ==="
+find "$GEN_DIR/compiled" -ls
 if [ -d "$GEN_DIR/compiled" ] && [ -n "$(ls -A "$GEN_DIR/compiled" 2>/dev/null || true)" ]; then
   cp -R "$GEN_DIR/compiled/"* "$OUT_DIR/intent_resources/"
+else
+  echo "警告：compiled 目录为空，回退拷贝原始 intentdefinition"
+  cp "$ROOT_DIR/src/ARAutoStart.intentdefinition" "$OUT_DIR/intent_resources/ARAutoStart.intentdefinition"
 fi
-cp "$ROOT_DIR/src/ARAutoStart.intentdefinition" "$OUT_DIR/intent_resources/ARAutoStart.intentdefinition"
 
 echo "=== 产物清单 ==="
 find "$OUT_DIR" -ls
