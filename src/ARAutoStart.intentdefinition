@@ -18,7 +18,7 @@
 	<array>
 		<dict>
 			<key>INIntentCategory</key>
-			<string>do</string>
+			<string>generic</string>
 			<key>INIntentClassPrefix</key>
 			<string>AR</string>
 			<key>INIntentConfigurable</key>
