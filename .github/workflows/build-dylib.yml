@@ -1,0 +1,31 @@
+name: Build AREnhance Dylib (iOS ARM64)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-dylib:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify Xcode & iOS SDK
+        run: |
+          xcode-select -p
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Build AREnhance.dylib & Intent Resources
+        run: |
+          chmod +x scripts/build_dylib.sh
+          ./scripts/build_dylib.sh
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AREnhance_iOS_ARM64
+          path: dist/
+          retention-days: 14
