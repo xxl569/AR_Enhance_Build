@@ -662,50 +662,75 @@ static void ARCollectQQContainers(NSString *__autoreleasing *outDataPath, NSArra
     }
 }
 
-static NSSet<NSString *> *ARDetectSelfQQUins(NSString *qqDataPath, NSArray<NSString *> *groupPaths) {
-    NSMutableSet<NSString *> *selfUins = [NSMutableSet set];
+// 精准判定唯一“当前正在登录的自己 QQ 号”（避免把历史曾登录过的小号误判为自己而排除）
+static NSString *ARDetectCurrentSelfQQUin(NSString *qqDataPath) {
+    if (qqDataPath.length == 0) return nil;
     NSFileManager *fm = [NSFileManager defaultManager];
+    NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
 
-    // 1. 从 com.tencent.mqq.plist 读取当前登录 QQ 号
-    if (qqDataPath.length > 0) {
-        NSString *plistPath = [qqDataPath stringByAppendingPathComponent:@"Library/Preferences/com.tencent.mqq.plist"];
-        NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:plistPath];
-        if ([prefs isKindOfClass:[NSDictionary class]]) {
-            for (NSString *k in prefs) {
-                NSString *kl = [k lowercaseString];
-                if ([kl containsString:@"selfuin"] || [kl containsString:@"currentuin"] ||
-                    [kl containsString:@"loginuin"] || [kl isEqualToString:@"uin"] ||
-                    [kl containsString:@"account"]) {
-                    id v = prefs[k];
-                    NSString *sv = [v isKindOfClass:[NSNumber class]] ? [v stringValue] : ([v isKindOfClass:[NSString class]] ? v : nil);
-                    if (sv && sv.length >= 5 && sv.length <= 11) {
-                        NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
-                        if ([sv rangeOfCharacterFromSet:nonDigits].location == NSNotFound) {
-                            [selfUins addObject:sv];
-                        }
-                    }
-                }
-            }
+    auto isValidUin = ^BOOL(NSString *s) {
+        return (s.length >= 5 && s.length <= 11 &&
+                ![s hasPrefix:@"0"] &&
+                [s rangeOfCharacterFromSet:nonDigits].location == NSNotFound);
+    };
+
+    // 1. 优先从 LYStorage 命名空间子目录与 MiniAppNotify 中找 mtime 最新的 <selfUin>（QQ 9.x 实测最准）
+    NSString *bestUin = nil;
+    time_t bestMtime = 0;
+
+    NSString *miniNotifyDir = [qqDataPath stringByAppendingPathComponent:@"Library/Caches/MiniAppNotify"];
+    for (NSString *name in ([fm contentsOfDirectoryAtPath:miniNotifyDir error:nil] ?: @[])) {
+        if (!isValidUin(name)) continue;
+        struct stat st;
+        NSString *full = [miniNotifyDir stringByAppendingPathComponent:name];
+        if (lstat(full.UTF8String, &st) == 0 && st.st_mtime > bestMtime) {
+            bestMtime = st.st_mtime;
+            bestUin = name;
         }
+    }
 
-        // 2. Documents/contents/<selfUin> 经典目录
-        NSString *contentsDir = [qqDataPath stringByAppendingPathComponent:@"Documents/contents"];
-        NSArray<NSString *> *subs = [fm contentsOfDirectoryAtPath:contentsDir error:nil];
-        NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
-        for (NSString *name in subs) {
-            if (name.length >= 5 && name.length <= 11 &&
-                [name rangeOfCharacterFromSet:nonDigits].location == NSNotFound &&
-                ![name hasPrefix:@"0"]) {
-                [selfUins addObject:name];
+    NSString *lyRoot = [qqDataPath stringByAppendingPathComponent:@"Library/Caches/LYStorage"];
+    for (NSString *ns in ([fm contentsOfDirectoryAtPath:lyRoot error:nil] ?: @[])) {
+        NSString *nsPath = [lyRoot stringByAppendingPathComponent:ns];
+        for (NSString *sub in ([fm contentsOfDirectoryAtPath:nsPath error:nil] ?: @[])) {
+            if (!isValidUin(sub)) continue;
+            struct stat st;
+            NSString *full = [nsPath stringByAppendingPathComponent:sub];
+            if (lstat(full.UTF8String, &st) == 0 && S_ISDIR(st.st_mode) && st.st_mtime > bestMtime) {
+                bestMtime = st.st_mtime;
+                bestUin = sub;
             }
         }
     }
-    return selfUins;
+    if (bestUin.length > 0) return bestUin;
+
+    // 2. 兜底读 com.tencent.mqq.plist
+    NSString *plistPath = [qqDataPath stringByAppendingPathComponent:@"Library/Preferences/com.tencent.mqq.plist"];
+    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+    if ([prefs isKindOfClass:[NSDictionary class]]) {
+        for (NSString *k in @[@"lastLoginUin", @"kCurrentUin", @"CurrentUin", @"selfUin", @"uin"]) {
+            id v = prefs[k];
+            NSString *sv = [v isKindOfClass:[NSNumber class]] ? [v stringValue] : ([v isKindOfClass:[NSString class]] ? v : nil);
+            if (sv && isValidUin(sv)) return sv;
+        }
+    }
+
+    // 3. 最后兜底：Documents/contents 下 mtime 最新的单个账号目录
+    NSString *contentsDir = [qqDataPath stringByAppendingPathComponent:@"Documents/contents"];
+    for (NSString *name in ([fm contentsOfDirectoryAtPath:contentsDir error:nil] ?: @[])) {
+        if (!isValidUin(name)) continue;
+        struct stat st;
+        NSString *full = [contentsDir stringByAppendingPathComponent:name];
+        if (lstat(full.UTF8String, &st) == 0 && st.st_mtime > bestMtime) {
+            bestMtime = st.st_mtime;
+            bestUin = name;
+        }
+    }
+    return bestUin;
 }
 
 static NSString *ARExtractPeerUinFromText(NSString *text, NSSet<NSString *> *selfUins, time_t nowSec) {
     if (text.length == 0) return nil;
-    // 优先匹配明确的通话对方字段名（取文本最后一次出现，代表最新通话）
     static NSRegularExpression *explicitRegex = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -734,7 +759,6 @@ static NSString *ARExtractPeerUinFromFilename(NSString *relPath, NSSet<NSString 
     static NSRegularExpression *fnRegex = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        // 匹配常见头像/资料/C2C会话缓存文件名中的 QQ 号，例如 123456789.jpg / head_123456789 / uin_123456789 / c2c_123456789
         fnRegex = [NSRegularExpression regularExpressionWithPattern:
             @"(?:^|[_\\-/])(?:uin|peer|fri|friend|head|avatar|c2c|av|call|chat|user)?[_\\-]?([1-9][0-9]{4,10})(?:[_\\.\\-]|$)"
             options:NSRegularExpressionCaseInsensitive
@@ -742,9 +766,9 @@ static NSString *ARExtractPeerUinFromFilename(NSString *relPath, NSSet<NSString 
     });
     if (!fnRegex) return nil;
 
-    // 仅在路径明显与头像/通话/会话相关时才采用文件名推断，避免把随机缓存数字当 QQ 号
     NSString *low = [relPath lowercaseString];
-    BOOL relevant = ([low containsString:@"head"] || [low containsString:@"avatar"] ||
+    BOOL relevant = ([low containsString:@"user_summary"] || [low containsString:@"lystorage"] ||
+                     [low containsString:@"head"] || [low containsString:@"avatar"] ||
                      [low containsString:@"face"] || [low containsString:@"av"] ||
                      [low containsString:@"voip"] || [low containsString:@"call"] ||
                      [low containsString:@"c2c"]  || [low containsString:@"friend"] ||
@@ -769,148 +793,213 @@ static NSString *ARResolveQQPeerUinAndWriteProbe(void) {
         NSString *qqDataPath = nil;
         NSArray<NSString *> *groupPaths = nil;
         ARCollectQQContainers(&qqDataPath, &groupPaths);
-        NSSet<NSString *> *selfUins = ARDetectSelfQQUins(qqDataPath, groupPaths);
 
-        NSMutableArray<NSDictionary *> *recentFiles = [NSMutableArray array];
-        NSMutableArray<NSString *> *rootsToScan = [NSMutableArray array];
-        if (qqDataPath.length > 0) {
-            for (NSString *sub in @[@"Library/Caches", @"Documents", @"tmp", @"Library/Application Support"]) {
-                NSString *full = [qqDataPath stringByAppendingPathComponent:sub];
-                if ([[NSFileManager defaultManager] fileExistsAtPath:full]) {
-                    [rootsToScan addObject:full];
-                }
-            }
-        }
-        for (NSString *gp in groupPaths) {
-            if ([[NSFileManager defaultManager] fileExistsAtPath:gp]) {
-                [rootsToScan addObject:gp];
-            }
-        }
+        NSString *currentSelfUin = ARDetectCurrentSelfQQUin(qqDataPath);
+        NSSet<NSString *> *selfUins = currentSelfUin ? [NSSet setWithObject:currentSelfUin] : [NSSet set];
 
-        // 快速遍历最近 30 秒内修改过的文件（限深度 <= 4 且总扫描项上限 6000，确保 <100ms 返回）
         NSFileManager *fm = [NSFileManager defaultManager];
-        NSInteger scanned = 0;
-        const NSInteger kMaxScan = 6000;
-        for (NSString *scanRoot in rootsToScan) {
-            NSUInteger rootDepth = [[scanRoot pathComponents] count];
-            NSDirectoryEnumerator *en = [fm enumeratorAtPath:scanRoot];
-            NSString *rel = nil;
-            while ((rel = [en nextObject]) != nil) {
-                if (++scanned > kMaxScan) break;
-                NSString *full = [scanRoot stringByAppendingPathComponent:rel];
-                NSUInteger depth = [[full pathComponents] count] - rootDepth;
-                if (depth > 4) {
-                    [en skipDescendants];
-                    continue;
-                }
-                struct stat st;
-                if (lstat(full.UTF8String, &st) != 0) continue;
-                if (S_ISDIR(st.st_mode)) {
-                    // 跳过明显无关的大型资源目录
-                    NSString *lowName = [rel.lastPathComponent lowercaseString];
-                    if ([lowName isEqualToString:@"webview"] || [lowName isEqualToString:@"miniapp"] ||
-                        [lowName isEqualToString:@"qzone"] || [lowName isEqualToString:@"shortvideo"] ||
-                        [lowName isEqualToString:@"ark"] || [lowName isEqualToString:@"hippy"]) {
-                        [en skipDescendants];
+        NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+        NSMutableArray<NSDictionary *> *lyCandidates = [NSMutableArray array];
+        NSMutableArray<NSDictionary *> *recentFiles = [NSMutableArray array];
+
+        // ====================================================================
+        // 定点靶心 1（极速 <5ms，QQ 9.x 实机探针实证命中）：
+        // DATA/Library/Caches/LYStorage/<namespace>/<currentSelfUin>/<peerUin>
+        // 典型路径：USER_SUMMARY_PRIVAC_ENGINE_NAMESPACE/<selfUin>/<peerUin>
+        // ====================================================================
+        if (qqDataPath.length > 0) {
+            NSString *lyRoot = [qqDataPath stringByAppendingPathComponent:@"Library/Caches/LYStorage"];
+            NSArray<NSString *> *namespaces = [fm contentsOfDirectoryAtPath:lyRoot error:nil] ?: @[];
+            for (NSString *ns in namespaces) {
+                NSString *nsPath = [lyRoot stringByAppendingPathComponent:ns];
+                NSArray<NSString *> *subEntries = [fm contentsOfDirectoryAtPath:nsPath error:nil] ?: @[];
+                for (NSString *sub in subEntries) {
+                    // 若已确定 currentSelfUin，只看当前登录账号名下的子目录；否则检查全部数字目录
+                    if (currentSelfUin && ![sub isEqualToString:currentSelfUin]) continue;
+                    NSString *selfDir = [nsPath stringByAppendingPathComponent:sub];
+                    NSArray<NSString *> *peerFiles = [fm contentsOfDirectoryAtPath:selfDir error:nil] ?: @[];
+                    for (NSString *pf in peerFiles) {
+                        // 提取纯数字文件名（或前缀数字）作为候选对方 QQ 号
+                        NSString *baseName = [pf stringByDeletingPathExtension];
+                        if (baseName.length < 5 || baseName.length > 11 || [baseName hasPrefix:@"0"]) continue;
+                        if ([baseName rangeOfCharacterFromSet:nonDigits].location != NSNotFound) continue;
+                        if ([selfUins containsObject:baseName] || ARIsLikelyTimestampOrInvalidUin(baseName, nowSec)) continue;
+
+                        NSString *full = [selfDir stringByAppendingPathComponent:pf];
+                        struct stat st;
+                        if (lstat(full.UTF8String, &st) != 0 || S_ISDIR(st.st_mode)) continue;
+                        time_t age = nowSec - st.st_mtime;
+                        if (age >= -5 && age <= 120) {
+                            int prio = ([[ns uppercaseString] containsString:@"USER_SUMMARY"]) ? 0 : 1;
+                            [lyCandidates addObject:@{
+                                @"uin": baseName,
+                                @"age": @(age),
+                                @"prio": @(prio),
+                                @"rel": [NSString stringWithFormat:@"LYStorage/%@/%@/%@", ns, sub, pf],
+                                @"size": @((long long)st.st_size)
+                            }];
+                        }
                     }
-                    continue;
-                }
-                time_t age = nowSec - st.st_mtime;
-                if (age >= -5 && age <= 30) {
-                    NSString *shortRel = qqDataPath.length > 0 && [full hasPrefix:qqDataPath]
-                        ? [@"DATA" stringByAppendingString:[full substringFromIndex:qqDataPath.length]]
-                        : [@"GRP/" stringByAppendingString:rel];
-                    [recentFiles addObject:@{
-                        @"full": full,
-                        @"rel": shortRel,
-                        @"age": @(age),
-                        @"size": @((long long)st.st_size)
-                    }];
                 }
             }
-            if (scanned > kMaxScan) break;
+            [lyCandidates sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                // 优先取 20 秒内最新修改；同区间优先 USER_SUMMARY 命名空间
+                NSInteger ageA = [a[@"age"] integerValue];
+                NSInteger ageB = [b[@"age"] integerValue];
+                BOOL freshA = (ageA <= 20);
+                BOOL freshB = (ageB <= 20);
+                if (freshA != freshB) return freshA ? NSOrderedAscending : NSOrderedDescending;
+                NSComparisonResult pr = [a[@"prio"] compare:b[@"prio"]];
+                if (pr != NSOrderedSame) return pr;
+                return [a[@"age"] compare:b[@"age"]];
+            }];
         }
-
-        // 按最新修改时间排序
-        [recentFiles sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-            return [a[@"age"] compare:b[@"age"]];
-        }];
 
         NSString *resolvedUin = nil;
         NSString *resolvedSource = @"none";
-
-        // 通道 1：读取最近修改的文本/日志/plist 尾部（最多检查前 15 个疑似日志文件）
-        NSInteger logChecked = 0;
-        for (NSDictionary *item in recentFiles) {
-            if (logChecked >= 15) break;
-            NSString *full = item[@"full"];
-            NSString *low = [full lowercaseString];
-            long long fsize = [item[@"size"] longLongValue];
-            if (fsize <= 0 || fsize > 64 * 1024 * 1024) continue;
-            BOOL isTextLike = ([low hasSuffix:@".log"] || [low hasSuffix:@".txt"] ||
-                               [low hasSuffix:@".plist"] || [low hasSuffix:@".json"] ||
-                               [low containsString:@"av"] || [low containsString:@"qav"] ||
-                               [low containsString:@"rtc"] || [low containsString:@"voip"]);
-            if (!isTextLike) continue;
-            logChecked++;
-
-            FILE *fp = fopen(full.UTF8String, "rb");
-            if (!fp) continue;
-            long long readLen = fsize > 32768 ? 32768 : fsize;
-            if (fsize > readLen) fseeko(fp, fsize - readLen, SEEK_SET);
-            char *buf = (char *)malloc((size_t)readLen + 1);
-            if (buf) {
-                size_t nr = fread(buf, 1, (size_t)readLen, fp);
-                buf[nr] = '\0';
-                // 把中间可能存在的 \0 替换为空格，方便在部分二进制/混合日志里做正则匹配
-                for (size_t k = 0; k < nr; k++) {
-                    if (buf[k] == '\0') buf[k] = ' ';
-                }
-                NSString *tailText = [[NSString alloc] initWithBytes:buf length:nr encoding:NSISOLatin1StringEncoding];
-                free(buf);
-                NSString *cand = ARExtractPeerUinFromText(tailText, selfUins, nowSec);
-                if (cand) {
-                    resolvedUin = cand;
-                    resolvedSource = [NSString stringWithFormat:@"log:%@", item[@"rel"]];
-                    fclose(fp);
-                    break;
-                }
-            }
-            fclose(fp);
+        if (lyCandidates.count > 0) {
+            NSDictionary *top = lyCandidates.firstObject;
+            resolvedUin = top[@"uin"];
+            resolvedSource = [NSString stringWithFormat:@"lystorage(%lds):%@",
+                              (long)[top[@"age"] integerValue], top[@"rel"]];
         }
 
-        // 通道 2：若日志未命中，从最近 25 秒变动的头像/资料/会话文件名中推断
+        // ====================================================================
+        // 定点靶心 2（各目录独立配额，不再被 Library/Caches 6000 文件截断）：
+        // 若靶心 1 未命中，快速扫描 QQXLog / Documents / tmp / AppGroup
+        // ====================================================================
         if (!resolvedUin) {
+            NSMutableArray<NSString *> *rootsToScan = [NSMutableArray array];
+            if (qqDataPath.length > 0) {
+                for (NSString *sub in @[@"Library/Caches/QQINI/QQXLog", @"Documents", @"tmp", @"Library/Application Support"]) {
+                    NSString *full = [qqDataPath stringByAppendingPathComponent:sub];
+                    if ([fm fileExistsAtPath:full]) [rootsToScan addObject:full];
+                }
+            }
+            for (NSString *gp in groupPaths) {
+                if ([fm fileExistsAtPath:gp]) [rootsToScan addObject:gp];
+            }
+
+            for (NSString *scanRoot in rootsToScan) {
+                NSInteger scannedInRoot = 0;
+                const NSInteger kMaxPerRoot = 1500;
+                NSUInteger rootDepth = [[scanRoot pathComponents] count];
+                NSDirectoryEnumerator *en = [fm enumeratorAtPath:scanRoot];
+                NSString *rel = nil;
+                while ((rel = [en nextObject]) != nil) {
+                    if (++scannedInRoot > kMaxPerRoot) break;
+                    NSString *full = [scanRoot stringByAppendingPathComponent:rel];
+                    NSUInteger depth = [[full pathComponents] count] - rootDepth;
+                    if (depth > 4) {
+                        [en skipDescendants];
+                        continue;
+                    }
+                    struct stat st;
+                    if (lstat(full.UTF8String, &st) != 0) continue;
+                    if (S_ISDIR(st.st_mode)) {
+                        NSString *lowName = [rel.lastPathComponent lowercaseString];
+                        if ([lowName isEqualToString:@"webview"] || [lowName isEqualToString:@"miniapp"] ||
+                            [lowName isEqualToString:@"qzone"] || [lowName isEqualToString:@"shortvideo"] ||
+                            [lowName isEqualToString:@"ark"] || [lowName isEqualToString:@"hippy"]) {
+                            [en skipDescendants];
+                        }
+                        continue;
+                    }
+                    time_t age = nowSec - st.st_mtime;
+                    if (age >= -5 && age <= 45) {
+                        NSString *shortRel = qqDataPath.length > 0 && [full hasPrefix:qqDataPath]
+                            ? [@"DATA" stringByAppendingString:[full substringFromIndex:qqDataPath.length]]
+                            : [@"GRP/" stringByAppendingString:rel];
+                        [recentFiles addObject:@{
+                            @"full": full,
+                            @"rel": shortRel,
+                            @"age": @(age),
+                            @"size": @((long long)st.st_size)
+                        }];
+                    }
+                }
+            }
+
+            [recentFiles sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                return [a[@"age"] compare:b[@"age"]];
+            }];
+
+            NSInteger logChecked = 0;
             for (NSDictionary *item in recentFiles) {
-                if ([item[@"age"] integerValue] > 25) break;
-                NSString *cand = ARExtractPeerUinFromFilename(item[@"rel"], selfUins, nowSec);
-                if (cand) {
-                    resolvedUin = cand;
-                    resolvedSource = [NSString stringWithFormat:@"filename:%@", item[@"rel"]];
-                    break;
+                if (logChecked >= 12) break;
+                NSString *full = item[@"full"];
+                NSString *low = [full lowercaseString];
+                long long fsize = [item[@"size"] longLongValue];
+                if (fsize <= 0 || fsize > 64 * 1024 * 1024) continue;
+                BOOL isTextLike = ([low hasSuffix:@".log"] || [low hasSuffix:@".txt"] ||
+                                   [low hasSuffix:@".plist"] || [low hasSuffix:@".json"] ||
+                                   [low containsString:@"av"] || [low containsString:@"qav"] ||
+                                   [low containsString:@"rtc"] || [low containsString:@"voip"]);
+                if (!isTextLike) continue;
+                logChecked++;
+
+                FILE *fp = fopen(full.UTF8String, "rb");
+                if (!fp) continue;
+                long long readLen = fsize > 32768 ? 32768 : fsize;
+                if (fsize > readLen) fseeko(fp, fsize - readLen, SEEK_SET);
+                char *buf = (char *)malloc((size_t)readLen + 1);
+                if (buf) {
+                    size_t nr = fread(buf, 1, (size_t)readLen, fp);
+                    buf[nr] = '\0';
+                    for (size_t k = 0; k < nr; k++) {
+                        if (buf[k] == '\0') buf[k] = ' ';
+                    }
+                    NSString *tailText = [[NSString alloc] initWithBytes:buf length:nr encoding:NSISOLatin1StringEncoding];
+                    free(buf);
+                    NSString *cand = ARExtractPeerUinFromText(tailText, selfUins, nowSec);
+                    if (cand) {
+                        resolvedUin = cand;
+                        resolvedSource = [NSString stringWithFormat:@"log:%@", item[@"rel"]];
+                        fclose(fp);
+                        break;
+                    }
+                }
+                fclose(fp);
+            }
+
+            if (!resolvedUin) {
+                for (NSDictionary *item in recentFiles) {
+                    if ([item[@"age"] integerValue] > 30) break;
+                    NSString *cand = ARExtractPeerUinFromFilename(item[@"rel"], selfUins, nowSec);
+                    if (cand) {
+                        resolvedUin = cand;
+                        resolvedSource = [NSString stringWithFormat:@"filename:%@", item[@"rel"]];
+                        break;
+                    }
                 }
             }
         }
 
-        // 写入只读诊断探针 /tmp/ar_qq_probe.log（便于后续按用户实际 QQ 版本精准调优）
+        // 写入只读诊断探针 /tmp/ar_qq_probe.log
         NSMutableString *probe = [NSMutableString string];
-        [probe appendFormat:@"=== QQ Peer Probe @ %ld ===\n", (long)nowSec];
+        [probe appendFormat:@"=== QQ Peer Probe v3 @ %ld ===\n", (long)nowSec];
         [probe appendFormat:@"qqDataPath: %@\n", qqDataPath ?: @"(nil)"];
-        [probe appendFormat:@"groupPaths(%lu): %@\n", (unsigned long)groupPaths.count, groupPaths ?: @[]];
-        [probe appendFormat:@"selfUins: %@\n", selfUins.allObjects];
+        [probe appendFormat:@"currentSelfUin: %@\n", currentSelfUin ?: @"(nil)"];
         [probe appendFormat:@"resolvedUin: %@ (source=%@)\n", resolvedUin ?: @"(not found)", resolvedSource];
-        [probe appendFormat:@"recentFiles(<=30s, count=%lu, scanned=%ld):\n", (unsigned long)recentFiles.count, (long)scanned];
-        NSUInteger maxShow = MIN(recentFiles.count, (NSUInteger)45);
-        for (NSUInteger i = 0; i < maxShow; i++) {
-            NSDictionary *it = recentFiles[i];
-            [probe appendFormat:@"  [%2lds ago | %8lldB] %@\n",
-             (long)[it[@"age"] integerValue], [it[@"size"] longLongValue], it[@"rel"]];
+        [probe appendFormat:@"lyCandidates(<=120s, count=%lu):\n", (unsigned long)lyCandidates.count];
+        for (NSUInteger i = 0; i < MIN(lyCandidates.count, (NSUInteger)15); i++) {
+            NSDictionary *it = lyCandidates[i];
+            [probe appendFormat:@"  [%3lds ago | p=%d | %6lldB] uin=%@ (%@)\n",
+             (long)[it[@"age"] integerValue], [it[@"prio"] intValue], [it[@"size"] longLongValue], it[@"uin"], it[@"rel"]];
+        }
+        if (recentFiles.count > 0) {
+            [probe appendFormat:@"fallbackRecentFiles(count=%lu):\n", (unsigned long)recentFiles.count];
+            for (NSUInteger i = 0; i < MIN(recentFiles.count, (NSUInteger)25); i++) {
+                NSDictionary *it = recentFiles[i];
+                [probe appendFormat:@"  [%2lds ago | %8lldB] %@\n",
+                 (long)[it[@"age"] integerValue], [it[@"size"] longLongValue], it[@"rel"]];
+            }
         }
         [probe writeToFile:kARQQProbeLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
         chmod(kARQQProbeLogPath.UTF8String, 0666);
 
-        ARLog(@"QQ 对方号码探测完成：uin=%@ source=%@ recentCount=%lu",
-              resolvedUin ?: @"QQCall", resolvedSource, (unsigned long)recentFiles.count);
+        ARLog(@"QQ 对方号码探测 v3 完成：self=%@ peer=%@ source=%@",
+              currentSelfUin ?: @"?", resolvedUin ?: @"QQCall", resolvedSource);
         return resolvedUin;
     }
 }
